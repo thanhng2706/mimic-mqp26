@@ -2,11 +2,9 @@ package main
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"log"
 	"net"
-	"strconv"
 	"strings"
 	"time"
 
@@ -23,7 +21,7 @@ type node struct {
 	nodes []string // every node's address, including this one
 	w, r  int
 	store *store.Store
-	clock clock.Clock
+	clock clock.Clock // counts this node's writes: our slot in every vector clock
 }
 
 func newNode(id int, nodes []string, w, r int) (*node, error) {
@@ -42,25 +40,24 @@ func (n *node) addr() string {
 
 // write: SET/DEL. Send to all nodes at once, succeed after W acks.
 func (n *node) write(key, value string, deleted bool) error {
-	// Catch our clock up to the newest version first, so this write wins.
+	// ASK first: the new write's clock covers every value we saw, so it replaces them.
+	seen := store.Vector{}
 	for _, res := range n.gather(key, n.r) {
-		if res.found {
-			n.clock.Observe(res.entry.Version.Time)
+		for _, e := range res.entries {
+			for node, t := range e.Clock {
+				seen[node] = max(seen[node], t)
+			}
 		}
 	}
-
-	// Make the new entry with a fresh version.
-	entry := store.Entry{
-		Value:   value,
-		Deleted: deleted,
-		Version: store.Version{Time: n.clock.Tick(), Node: n.id},
-	}
+	n.clock.Observe(seen[n.id])
+	seen[n.id] = n.clock.Tick()
+	entries := []store.Entry{{Value: value, Clock: seen, Deleted: deleted}}
 
 	// Send it to every node in parallel.
 	results := make(chan error, len(n.nodes))
 	for _, addr := range n.nodes {
 		go func() {
-			results <- n.put(addr, key, entry)
+			results <- n.put(addr, key, entries)
 		}()
 	}
 
@@ -80,44 +77,36 @@ func (n *node) write(key, value string, deleted bool) error {
 }
 
 type readResult struct {
-	addr  string
-	entry store.Entry
-	found bool
-	err   error
+	addr    string
+	entries []store.Entry
+	err     error
 }
 
-// read: GET. Ask all nodes, wait for R answers, return the newest, repair stale nodes.
-func (n *node) read(key string) (store.Entry, bool, error) {
+// read: GET. Ask all nodes, wait for R answers, merge them, repair the nodes that answered.
+func (n *node) read(key string) ([]store.Entry, error) {
 	// Ask the nodes; refuse if fewer than R answer.
 	answers := n.gather(key, n.r)
 	if len(answers) < n.r {
-		return store.Entry{}, false, fmt.Errorf("only %d of %d required replicas answered", len(answers), n.r)
+		return nil, fmt.Errorf("only %d of %d required replicas answered", len(answers), n.r)
 	}
 
-	// Pick the newest answer.
-	var newest store.Entry
-	found := false
+	// Merge all answers: keeps the newest value, or several if they're concurrent.
+	var merged []store.Entry
 	for _, res := range answers {
-		if res.found && (!found || res.entry.Version.Newer(newest.Version)) {
-			newest, found = res.entry, true
-		}
+		merged = store.Merge(merged, res.entries)
 	}
-	if !found {
-		return store.Entry{}, false, nil
-	}
-	n.clock.Observe(newest.Version.Time)
 
-	// Read repair: send the newest entry to nodes that had something older.
+	// Read repair: send the merged values back; Apply ignores what a node already has.
 	for _, res := range answers {
-		if !res.found || newest.Version.Newer(res.entry.Version) {
+		if len(merged) > 0 {
 			go func() {
-				if err := n.put(res.addr, key, newest); err != nil {
+				if err := n.put(res.addr, key, merged); err != nil {
 					log.Printf("read repair %s on %s: %v", key, res.addr, err)
 				}
 			}()
 		}
 	}
-	return newest, true, nil
+	return merged, nil
 }
 
 // gather: ask all nodes for key at once, return the first `need` answers.
@@ -125,8 +114,8 @@ func (n *node) gather(key string, need int) []readResult {
 	results := make(chan readResult, len(n.nodes))
 	for _, addr := range n.nodes {
 		go func() {
-			entry, found, err := n.fetch(addr, key)
-			results <- readResult{addr, entry, found, err}
+			entries, err := n.fetch(addr, key)
+			results <- readResult{addr, entries, err}
 		}()
 	}
 
@@ -145,24 +134,24 @@ func (n *node) gather(key string, need int) []readResult {
 	return answers
 }
 
-// antiEntropy: TELL every other node all our entries; their Apply keeps only newer ones.
+// antiEntropy: TELL every other node all our entries; their Apply merges them in.
 func (n *node) antiEntropy() {
-	entries := n.store.All()
+	all := n.store.All()
 	for _, addr := range n.nodes {
 		if addr == n.addr() {
 			continue
 		}
-		for key, entry := range entries {
-			if n.put(addr, key, entry) != nil {
+		for key, entries := range all {
+			if n.put(addr, key, entries) != nil {
 				break // node is down, try again next round
 			}
 		}
 	}
 }
 
-// put: send PUT to one node (store this entry).
-func (n *node) put(addr, key string, entry store.Entry) error {
-	resp, err := call(addr, "PUT "+key+" "+formatEntry(entry))
+// put: send PUT to one node (merge these values).
+func (n *node) put(addr, key string, entries []store.Entry) error {
+	resp, err := call(addr, "PUT "+key+" "+formatEntries(entries))
 	if err != nil {
 		return err
 	}
@@ -173,23 +162,23 @@ func (n *node) put(addr, key string, entry store.Entry) error {
 }
 
 // fetch: send READ to one node (what do you have for key?).
-func (n *node) fetch(addr, key string) (store.Entry, bool, error) {
+func (n *node) fetch(addr, key string) ([]store.Entry, error) {
 	resp, err := call(addr, "READ "+key)
 	if err != nil {
-		return store.Entry{}, false, err
+		return nil, err
 	}
 	if resp == "NONE" {
-		return store.Entry{}, false, nil
+		return nil, nil
 	}
 	fields := strings.Fields(resp)
-	if len(fields) < 4 || fields[0] != "ENTRY" {
-		return store.Entry{}, false, fmt.Errorf("%s: unexpected reply %q", addr, resp)
+	if len(fields) < 2 || fields[0] != "ENTRY" {
+		return nil, fmt.Errorf("%s: unexpected reply %q", addr, resp)
 	}
-	entry, err := parseEntry(fields[1:])
+	entries, err := parseEntries(fields[1:])
 	if err != nil {
-		return store.Entry{}, false, fmt.Errorf("%s: %v", addr, err)
+		return nil, fmt.Errorf("%s: %v", addr, err)
 	}
-	return entry, true, nil
+	return entries, nil
 }
 
 // call: send one line over TCP, return the reply.
@@ -211,33 +200,40 @@ func call(addr, line string) (string, error) {
 	return strings.TrimSpace(resp), nil
 }
 
-// formatEntry / parseEntry: Entry <-> text "time node deleted [value]".
-func formatEntry(e store.Entry) string {
-	deleted := 0
-	if e.Deleted {
-		deleted = 1
+// formatEntries / parseEntries: entries <-> text, one "clock/deleted/value" each, e.g. "1:2,3:1/0/cat".
+func formatEntries(entries []store.Entry) string {
+	var parts []string
+	for _, e := range entries {
+		var slots []string
+		for node, t := range e.Clock {
+			slots = append(slots, fmt.Sprintf("%d:%d", node, t))
+		}
+		deleted := 0
+		if e.Deleted {
+			deleted = 1
+		}
+		parts = append(parts, fmt.Sprintf("%s/%d/%s", strings.Join(slots, ","), deleted, e.Value))
 	}
-	return fmt.Sprintf("%d %d %d %s", e.Version.Time, e.Version.Node, deleted, e.Value)
+	return strings.Join(parts, " ")
 }
 
-func parseEntry(fields []string) (store.Entry, error) {
-	if len(fields) < 3 {
-		return store.Entry{}, errors.New("entry needs time, node and deleted")
+func parseEntries(fields []string) ([]store.Entry, error) {
+	var entries []store.Entry
+	for _, f := range fields {
+		parts := strings.SplitN(f, "/", 3)
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("bad entry %q", f)
+		}
+		e := store.Entry{Clock: store.Vector{}, Deleted: parts[1] == "1", Value: parts[2]}
+		for _, slot := range strings.Split(parts[0], ",") {
+			var node int
+			var t uint64
+			if _, err := fmt.Sscanf(slot, "%d:%d", &node, &t); err != nil {
+				return nil, fmt.Errorf("bad clock %q", parts[0])
+			}
+			e.Clock[node] = t
+		}
+		entries = append(entries, e)
 	}
-	t, err := strconv.ParseUint(fields[0], 10, 64)
-	if err != nil {
-		return store.Entry{}, fmt.Errorf("bad time %q", fields[0])
-	}
-	nodeID, err := strconv.Atoi(fields[1])
-	if err != nil {
-		return store.Entry{}, fmt.Errorf("bad node %q", fields[1])
-	}
-	entry := store.Entry{
-		Version: store.Version{Time: t, Node: nodeID},
-		Deleted: fields[2] == "1",
-	}
-	if len(fields) > 3 {
-		entry.Value = fields[3]
-	}
-	return entry, nil
+	return entries, nil
 }

@@ -2,65 +2,80 @@ package store
 
 import (
 	"maps"
+	"slices"
 	"sync"
 )
 
-// Version: how new a value is. Time is from the Lamport clock, Node breaks ties.
-type Version struct {
-	Time uint64
-	Node int
-}
+// Vector: vector clock, one counter per node ID: how many writes from each node a value has seen.
+type Vector map[int]uint64
 
-// Newer: higher Time wins; same Time, higher Node wins.
-func (v Version) Newer(other Version) bool {
-	if v.Time != other.Time {
-		return v.Time > other.Time
+// Covers: v has seen everything other has (every slot >=).
+func (v Vector) Covers(other Vector) bool {
+	for node, t := range other {
+		if v[node] < t {
+			return false
+		}
 	}
-	return v.Node > other.Node
+	return true
 }
 
-// Entry: what we store per key. Deleted=true is a tombstone (delete marker).
+// Entry: one value of a key. Deleted=true is a tombstone (delete marker).
 type Entry struct {
 	Value   string
-	Version Version
+	Clock   Vector
 	Deleted bool
+}
+
+// Merge: combine two lists of values for a key; drop any value another one has seen.
+// What's left are concurrent values (usually just one).
+func Merge(a, b []Entry) []Entry {
+	all := append(slices.Clone(a), b...)
+	var kept []Entry
+	for i, e := range all {
+		seen := false
+		for j, o := range all {
+			// o has seen e: drop e (for two copies of the same write, keep the first).
+			if j != i && o.Clock.Covers(e.Clock) && (j < i || !e.Clock.Covers(o.Clock)) {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			kept = append(kept, e)
+		}
+	}
+	return kept
 }
 
 type Store struct {
 	mu   sync.RWMutex // one writer or many readers at a time
-	data map[string]Entry
+	data map[string][]Entry
 }
 
 func NewStore() *Store {
-	return &Store{data: make(map[string]Entry)}
+	return &Store{data: make(map[string][]Entry)}
 }
 
-// Get: return the entry for key, tombstones included.
-func (s *Store) Get(key string) (Entry, bool) {
+// Get: return the values for key, tombstones included (nil if none).
+func (s *Store) Get(key string) []Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	entry, ok := s.data[key]
-	return entry, ok
+	return s.data[key]
 }
 
-// All: copy of every entry, for anti-entropy.
-func (s *Store) All() map[string]Entry {
+// All: copy of every key's values, for anti-entropy.
+func (s *Store) All() map[string][]Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	return maps.Clone(s.data)
 }
 
-// Apply: save entry only if it's newer than what we have. Returns true if saved.
-func (s *Store) Apply(key string, entry Entry) bool {
+// Apply: merge incoming values into what we have for key.
+func (s *Store) Apply(key string, incoming []Entry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	current, ok := s.data[key]
-	if ok && !entry.Version.Newer(current.Version) {
-		return false
-	}
-	s.data[key] = entry
-	return true
+	s.data[key] = Merge(s.data[key], incoming)
 }

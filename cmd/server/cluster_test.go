@@ -146,7 +146,7 @@ func TestReadRepairFixesStaleNode(t *testing.T) {
 	c.send(1, "SET x 5") // node 3 misses this write
 	c.restart(3)
 
-	if _, ok := c.nodes[2].store.Get("x"); ok {
+	if c.nodes[2].store.Get("x") != nil {
 		t.Fatal("node 3 should not have x yet")
 	}
 	// R=3, so this read hears from node 3 and repairs it.
@@ -156,7 +156,7 @@ func TestReadRepairFixesStaleNode(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if e, ok := c.nodes[2].store.Get("x"); ok && e.Value == "5" {
+		if e := c.nodes[2].store.Get("x"); len(e) == 1 && e[0].Value == "5" {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -171,7 +171,34 @@ func TestAntiEntropyFixesStaleNode(t *testing.T) {
 	c.restart(3)
 
 	c.nodes[0].antiEntropy() // one round, no GET needed
-	if e, ok := c.nodes[2].store.Get("x"); !ok || e.Value != "5" {
+	if e := c.nodes[2].store.Get("x"); len(e) != 1 || e[0].Value != "5" {
 		t.Fatal("anti-entropy did not copy x to node 3")
+	}
+}
+
+func TestConcurrentWritesAreBothKept(t *testing.T) {
+	// W=1, R=1 and a network split: each side accepts a write without seeing the other.
+	c := startCluster(t, 3, 1, 1)
+	c.stop(2)
+	c.stop(3)
+	c.send(1, "SET x a") // only node 1 has a
+	c.stop(1)
+	c.restart(3)
+	c.send(3, "SET x b") // node 3 never saw a
+	c.restart(1)
+	c.restart(2)
+
+	// Heal: anti-entropy spreads both values everywhere.
+	c.nodes[0].antiEntropy()
+	c.nodes[2].antiEntropy()
+	if got := c.send(2, "GET x"); got != "VALUES a b" {
+		t.Fatalf("GET = %q, want VALUES a b (neither write lost)", got)
+	}
+
+	// The next SET has seen both, so it replaces both.
+	c.send(2, "SET x c")
+	c.nodes[1].antiEntropy() // W=1: make sure every node has c before reading with R=1
+	if got := c.send(1, "GET x"); got != "VALUE c" {
+		t.Fatalf("GET after resolving = %q, want VALUE c", got)
 	}
 }

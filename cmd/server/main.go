@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"slices"
 	"strings"
 	"time"
 )
@@ -91,14 +92,25 @@ func handleCommand(line string, n *node) string {
 		if len(fields) != 2 {
 			return "ERROR usage: GET key"
 		}
-		entry, found, err := n.read(fields[1])
+		entries, err := n.read(fields[1])
 		if err != nil {
 			return "ERROR " + err.Error()
 		}
-		if !found || entry.Deleted {
-			return "NOT_FOUND"
+		var values []string
+		for _, e := range entries {
+			if !e.Deleted {
+				values = append(values, e.Value)
+			}
 		}
-		return "VALUE " + entry.Value
+		slices.Sort(values)
+		switch len(values) {
+		case 0:
+			return "NOT_FOUND"
+		case 1:
+			return "VALUE " + values[0]
+		default: // concurrent writes: show all, the next SET replaces them
+			return "VALUES " + strings.Join(values, " ")
+		}
 
 	case "SET":
 		if len(fields) != 3 {
@@ -119,26 +131,28 @@ func handleCommand(line string, n *node) string {
 		return "OK"
 
 	case "PUT":
-		if len(fields) < 5 {
-			return "ERROR usage: PUT key time node deleted [value]"
+		if len(fields) < 3 {
+			return "ERROR usage: PUT key clock/deleted/value..."
 		}
-		entry, err := parseEntry(fields[2:])
+		entries, err := parseEntries(fields[2:])
 		if err != nil {
 			return "ERROR " + err.Error()
 		}
-		n.clock.Observe(entry.Version.Time)
-		n.store.Apply(fields[1], entry)
+		for _, e := range entries {
+			n.clock.Observe(e.Clock[n.id]) // after a restart, don't reuse our old counter values
+		}
+		n.store.Apply(fields[1], entries)
 		return "ACK"
 
 	case "READ":
 		if len(fields) != 2 {
 			return "ERROR usage: READ key"
 		}
-		entry, ok := n.store.Get(fields[1])
-		if !ok {
+		entries := n.store.Get(fields[1])
+		if len(entries) == 0 {
 			return "NONE"
 		}
-		return "ENTRY " + formatEntry(entry)
+		return "ENTRY " + formatEntries(entries)
 
 	default:
 		return "ERROR unknown command"
