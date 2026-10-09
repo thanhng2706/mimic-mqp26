@@ -1,6 +1,9 @@
 package store
 
-import "sync"
+import (
+	"maps"
+	"sync"
+)
 
 // Version: how new a value is. Time is from the Lamport clock, Node breaks ties.
 type Version struct {
@@ -39,6 +42,14 @@ func (s *Store) Get(key string) (Entry, bool) {
 
 	entry, ok := s.data[key]
 	return entry, ok
+}
+
+// All: copy of every entry, for anti-entropy.
+func (s *Store) All() map[string]Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return maps.Clone(s.data)
 }
 
 // Apply: save entry only if it's newer than what we have. Returns true if saved.

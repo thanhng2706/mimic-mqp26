@@ -145,6 +145,21 @@ func (n *node) gather(key string, need int) []readResult {
 	return answers
 }
 
+// antiEntropy: TELL every other node all our entries; their Apply keeps only newer ones.
+func (n *node) antiEntropy() {
+	entries := n.store.All()
+	for _, addr := range n.nodes {
+		if addr == n.addr() {
+			continue
+		}
+		for key, entry := range entries {
+			if n.put(addr, key, entry) != nil {
+				break // node is down, try again next round
+			}
+		}
+	}
+}
+
 // put: send PUT to one node (store this entry).
 func (n *node) put(addr, key string, entry store.Entry) error {
 	resp, err := call(addr, "PUT "+key+" "+formatEntry(entry))

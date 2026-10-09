@@ -163,3 +163,15 @@ func TestReadRepairFixesStaleNode(t *testing.T) {
 	}
 	t.Fatal("read repair did not copy x to node 3")
 }
+
+func TestAntiEntropyFixesStaleNode(t *testing.T) {
+	c := startCluster(t, 3, 2, 2)
+	c.stop(3)
+	c.send(1, "SET x 5") // node 3 misses this write
+	c.restart(3)
+
+	c.nodes[0].antiEntropy() // one round, no GET needed
+	if e, ok := c.nodes[2].store.Get("x"); !ok || e.Value != "5" {
+		t.Fatal("anti-entropy did not copy x to node 3")
+	}
+}

@@ -8,7 +8,11 @@ import (
 	"log"
 	"net"
 	"strings"
+	"time"
 )
+
+// syncEvery: how often each node runs anti-entropy.
+const syncEvery = 2 * time.Second
 
 func main() {
 	id := flag.Int("id", 1, "this node's ID, 1-based position in -nodes")
@@ -35,6 +39,11 @@ func main() {
 		log.Printf("warning: W+R <= N, read and write quorums may not overlap, so reads can be stale")
 	}
 
+	go func() {
+		for range time.Tick(syncEvery) {
+			n.antiEntropy()
+		}
+	}()
 	serve(listener, n)
 }
 
