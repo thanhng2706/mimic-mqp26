@@ -40,35 +40,35 @@ Server flags: `-id` (this node's 1-based position in `-nodes`), `-nodes` (comma-
 ## How it works
 
 ```
-   client ──► any node (it coordinates the request)
-                  │
+   client ──► any node (coordinator)
+                  │  PUT / READ
         ┌─────────┼─────────┐
-      node 1    node 2    node 3     (each holds a full copy)
+      node 1    node 2    node 3     (full replicas)
 ```
 
-**Writing (SET / DEL).** The node you contact first asks the others what they have for the key, then sends the new value to every node. It replies `OK` once W nodes have saved it.
+**Write path (SET / DEL).** The coordinator reads the key from R replicas, tags the new value with a dot and causal context, sends it to all replicas, and acknowledges after a write quorum of W.
 
-**Reading (GET).** The node asks every node for the key and combines the first R answers. If some nodes had an older copy, it sends them the up-to-date one.
+**Read path (GET).** The coordinator queries all replicas, merges the first R responses, and returns the result with its causal context. Stale replicas are updated through **read repair**.
 
-**Detecting concurrent writes.** Each value records two things: its own ID (which node wrote it, and that node's write number, e.g. `1:1`) and the IDs of the writes it had seen. A value is replaced only by a value that had seen it:
+**Dotted version vectors.** Each value carries a **dot**, a unique write ID (`node:counter`), and a **causal context**, the dots it had seen. A value is superseded only by a value whose context includes its dot; otherwise the two are concurrent and kept as **siblings**:
 
-| Value | ID | Had seen | Result |
+| Value | Dot | Context | Result |
 |---|---|---|---|
-| `a` | `1:1` | nothing | |
-| `b`, written after reading `a` | `1:2` | `1:1` | `b` replaces `a` |
-| `c`, written by someone who never saw `b` | `2:1` | `1:1` | `b` and `c` are both kept: `GET` returns `VALUES b c` |
+| `a` | `1:1` | — | |
+| `b` | `1:2` | `1:1` | supersedes `a` |
+| `c` | `2:1` | `1:1` | concurrent with `b`: `GET` returns `VALUES b c` |
 
-A write made with the context of `VALUES b c` has seen both, so it replaces them.
+Clients pass the context from `GET` to the next `SET`/`DEL`, so a write supersedes only the values the client actually read.
 
-**Combining copies.** When two copies of a key meet, the result keeps every value that no other value has seen. Order and duplicate messages don't change the result, so all nodes end up identical (this is what makes it a CRDT).
+**MV-Register merge.** Replicas merge by keeping every value not covered by another value's context. The merge is commutative, associative and idempotent, so this is a **state-based CRDT**: replicas converge regardless of message order or duplication.
 
-**Deletes.** DEL saves a "deleted" marker instead of removing the key, so a node with an old copy can't bring the value back.
+**Tombstones.** DEL writes a deletion marker with its own dot, so a stale replica can't resurrect the value.
 
-**Catching up.** Every 2 seconds, each node sends all its data to the others, so a node that was down gets every key back.
+**Anti-entropy.** Every 2 seconds, each node pushes its full state to every other node, guaranteeing convergence for keys that are never read.
 
-| Folder | What's in it |
+| Path | Contents |
 |---|---|
-| `store/` | The data, write IDs and contexts, and the rule for combining copies |
-| `clock/` | Counts this node's own writes |
-| `cmd/server/` | The server: networking, reads, writes, catching up |
+| `store/` | Dots, causal contexts, MV-Register merge, thread-safe storage |
+| `clock/` | Per-node write counter used to assign dots |
+| `cmd/server/` | TCP server, quorum reads/writes, read repair, anti-entropy |
 | `cmd/client/` | Command-line client |
