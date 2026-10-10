@@ -6,24 +6,38 @@ import (
 	"sync"
 )
 
-// Vector: vector clock, one counter per node ID: how many writes from each node a value has seen.
+// Vector: one counter per node ID, e.g. {1: 2} = "node 1's first 2 writes".
 type Vector map[int]uint64
 
-// Covers: v has seen everything other has (every slot >=).
-func (v Vector) Covers(other Vector) bool {
-	for node, t := range other {
-		if v[node] < t {
-			return false
-		}
-	}
-	return true
+// Dot: the ID of one write: the node that made it and that node's write count.
+type Dot struct {
+	Node    int
+	Counter uint64
 }
 
-// Entry: one value of a key. Deleted=true is a tombstone (delete marker).
+// Entry: one value of a key. Context = the writes it had seen. Deleted=true is a tombstone.
 type Entry struct {
 	Value   string
-	Clock   Vector
+	Dot     Dot
+	Context Vector
 	Deleted bool
+}
+
+// Seen: e had seen write d when it was written.
+func (e Entry) Seen(d Dot) bool {
+	return e.Context[d.Node] >= d.Counter
+}
+
+// Context: every write these values had seen, plus the values themselves.
+func Context(entries []Entry) Vector {
+	v := Vector{}
+	for _, e := range entries {
+		for node, t := range e.Context {
+			v[node] = max(v[node], t)
+		}
+		v[e.Dot.Node] = max(v[e.Dot.Node], e.Dot.Counter)
+	}
+	return v
 }
 
 // Merge: combine two lists of values for a key; drop any value another one has seen.
@@ -32,15 +46,9 @@ func Merge(a, b []Entry) []Entry {
 	all := append(slices.Clone(a), b...)
 	var kept []Entry
 	for i, e := range all {
-		seen := false
-		for j, o := range all {
-			// o has seen e: drop e (for two copies of the same write, keep the first).
-			if j != i && o.Clock.Covers(e.Clock) && (j < i || !e.Clock.Covers(o.Clock)) {
-				seen = true
-				break
-			}
-		}
-		if !seen {
+		seen := slices.ContainsFunc(all, func(o Entry) bool { return o.Seen(e.Dot) })
+		dup := slices.ContainsFunc(all[:i], func(o Entry) bool { return o.Dot == e.Dot })
+		if !seen && !dup {
 			kept = append(kept, e)
 		}
 	}

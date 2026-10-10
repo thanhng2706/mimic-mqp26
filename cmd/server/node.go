@@ -38,20 +38,24 @@ func (n *node) addr() string {
 	return n.nodes[n.id-1]
 }
 
-// write: SET/DEL. Send to all nodes at once, succeed after W acks.
-func (n *node) write(key, value string, deleted bool) error {
-	// ASK first: the new write's clock covers every value we saw, so it replaces them.
-	seen := store.Vector{}
+// write: SET/DEL. context = what the client read (nil: replace everything we find).
+// Send to all nodes at once, succeed after W acks.
+func (n *node) write(key, value string, deleted bool, context store.Vector) error {
+	// ASK first: catch our counter up so this write gets a new, unique ID.
+	var found []store.Entry
 	for _, res := range n.gather(key, n.r) {
-		for _, e := range res.entries {
-			for node, t := range e.Clock {
-				seen[node] = max(seen[node], t)
-			}
-		}
+		found = append(found, res.entries...)
 	}
-	n.clock.Observe(seen[n.id])
-	seen[n.id] = n.clock.Tick()
-	entries := []store.Entry{{Value: value, Clock: seen, Deleted: deleted}}
+	if context == nil {
+		context = store.Context(found)
+	}
+	n.clock.Observe(max(store.Context(found)[n.id], context[n.id]))
+	entries := []store.Entry{{
+		Value:   value,
+		Dot:     store.Dot{Node: n.id, Counter: n.clock.Tick()},
+		Context: context,
+		Deleted: deleted,
+	}}
 
 	// Send it to every node in parallel.
 	results := make(chan error, len(n.nodes))
@@ -200,19 +204,40 @@ func call(addr, line string) (string, error) {
 	return strings.TrimSpace(resp), nil
 }
 
-// formatEntries / parseEntries: entries <-> text, one "clock/deleted/value" each, e.g. "1:2,3:1/0/cat".
+// formatVector / parseVector: Vector <-> text, e.g. "1:2,3:1" ("" is empty).
+func formatVector(v store.Vector) string {
+	var slots []string
+	for node, t := range v {
+		slots = append(slots, fmt.Sprintf("%d:%d", node, t))
+	}
+	return strings.Join(slots, ",")
+}
+
+func parseVector(s string) (store.Vector, error) {
+	v := store.Vector{}
+	for slot := range strings.SplitSeq(s, ",") {
+		var node int
+		var t uint64
+		if _, err := fmt.Sscanf(slot, "%d:%d", &node, &t); slot != "" && err != nil {
+			return nil, fmt.Errorf("bad vector %q", s)
+		}
+		v[node] = max(v[node], t)
+	}
+	delete(v, 0) // from an empty slot
+	return v, nil
+}
+
+// formatEntries / parseEntries: entries <-> text, one "dot|context/deleted/value" each,
+// e.g. "1:3|1:1/0/cat" = node 1's 3rd write, had seen node 1's 1st, value cat.
 func formatEntries(entries []store.Entry) string {
 	var parts []string
 	for _, e := range entries {
-		var slots []string
-		for node, t := range e.Clock {
-			slots = append(slots, fmt.Sprintf("%d:%d", node, t))
-		}
 		deleted := 0
 		if e.Deleted {
 			deleted = 1
 		}
-		parts = append(parts, fmt.Sprintf("%s/%d/%s", strings.Join(slots, ","), deleted, e.Value))
+		dot := formatVector(store.Vector{e.Dot.Node: e.Dot.Counter})
+		parts = append(parts, fmt.Sprintf("%s|%s/%d/%s", dot, formatVector(e.Context), deleted, e.Value))
 	}
 	return strings.Join(parts, " ")
 }
@@ -221,17 +246,17 @@ func parseEntries(fields []string) ([]store.Entry, error) {
 	var entries []store.Entry
 	for _, f := range fields {
 		parts := strings.SplitN(f, "/", 3)
-		if len(parts) != 3 {
+		dot, context, ok := strings.Cut(parts[0], "|")
+		if len(parts) != 3 || !ok {
 			return nil, fmt.Errorf("bad entry %q", f)
 		}
-		e := store.Entry{Clock: store.Vector{}, Deleted: parts[1] == "1", Value: parts[2]}
-		for _, slot := range strings.Split(parts[0], ",") {
-			var node int
-			var t uint64
-			if _, err := fmt.Sscanf(slot, "%d:%d", &node, &t); err != nil {
-				return nil, fmt.Errorf("bad clock %q", parts[0])
-			}
-			e.Clock[node] = t
+		e := store.Entry{Deleted: parts[1] == "1", Value: parts[2]}
+		if _, err := fmt.Sscanf(dot, "%d:%d", &e.Dot.Node, &e.Dot.Counter); err != nil {
+			return nil, fmt.Errorf("bad dot %q", dot)
+		}
+		var err error
+		if e.Context, err = parseVector(context); err != nil {
+			return nil, err
 		}
 		entries = append(entries, e)
 	}

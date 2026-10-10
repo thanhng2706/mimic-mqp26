@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -42,14 +43,15 @@ func startCluster(t *testing.T, size, w, r int) *cluster {
 	return c
 }
 
-// send runs a client command against node i (1-based).
-func (c *cluster) send(i int, line string) string {
+// send runs a client command against node i (1-based); returns the reply and GET's context.
+func (c *cluster) send(i int, line string) (string, string) {
 	c.t.Helper()
 	resp, err := call(c.nodes[i-1].addr(), line)
 	if err != nil {
 		c.t.Fatalf("node %d: %v", i, err)
 	}
-	return resp
+	reply, context, _ := strings.Cut(resp, " CONTEXT ")
+	return reply, context
 }
 
 // stop makes node i unreachable, like a crash or a network partition.
@@ -71,10 +73,10 @@ func (c *cluster) restart(i int) {
 func TestWriteOnOneNodeReadOnAnother(t *testing.T) {
 	c := startCluster(t, 3, 2, 2)
 
-	if got := c.send(1, "SET x 5"); got != "OK" {
+	if got, _ := c.send(1, "SET x 5"); got != "OK" {
 		t.Fatalf("SET = %q", got)
 	}
-	if got := c.send(3, "GET x"); got != "VALUE 5" {
+	if got, _ := c.send(3, "GET x"); got != "VALUE 5" {
 		t.Fatalf("GET on node 3 = %q, want VALUE 5", got)
 	}
 }
@@ -84,7 +86,7 @@ func TestLaterWriteWinsAcrossCoordinators(t *testing.T) {
 
 	c.send(1, "SET x 1")
 	c.send(2, "SET x 2")
-	if got := c.send(3, "GET x"); got != "VALUE 2" {
+	if got, _ := c.send(3, "GET x"); got != "VALUE 2" {
 		t.Fatalf("GET = %q, want VALUE 2", got)
 	}
 }
@@ -98,7 +100,7 @@ func TestWriteAfterAckedWriteWins(t *testing.T) {
 	c.restart(1)
 
 	c.send(1, "SET x 2")
-	if got := c.send(3, "GET x"); got != "VALUE 2" {
+	if got, _ := c.send(3, "GET x"); got != "VALUE 2" {
 		t.Fatalf("GET = %q, want VALUE 2 (the later write)", got)
 	}
 }
@@ -107,10 +109,10 @@ func TestDeleteIsReplicated(t *testing.T) {
 	c := startCluster(t, 3, 2, 2)
 
 	c.send(1, "SET x 5")
-	if got := c.send(2, "DEL x"); got != "OK" {
+	if got, _ := c.send(2, "DEL x"); got != "OK" {
 		t.Fatalf("DEL = %q", got)
 	}
-	if got := c.send(3, "GET x"); got != "NOT_FOUND" {
+	if got, _ := c.send(3, "GET x"); got != "NOT_FOUND" {
 		t.Fatalf("GET after DEL = %q, want NOT_FOUND", got)
 	}
 }
@@ -119,10 +121,10 @@ func TestWorksWithOneNodeDown(t *testing.T) {
 	c := startCluster(t, 3, 2, 2)
 	c.stop(3)
 
-	if got := c.send(1, "SET x 5"); got != "OK" {
+	if got, _ := c.send(1, "SET x 5"); got != "OK" {
 		t.Fatalf("SET with 2 of 3 up = %q, want OK", got)
 	}
-	if got := c.send(2, "GET x"); got != "VALUE 5" {
+	if got, _ := c.send(2, "GET x"); got != "VALUE 5" {
 		t.Fatalf("GET with 2 of 3 up = %q, want VALUE 5", got)
 	}
 }
@@ -134,7 +136,7 @@ func TestRefusesWritesWithoutQuorum(t *testing.T) {
 	c.stop(2)
 	c.stop(3)
 
-	got := c.send(1, "SET x 5")
+	got, _ := c.send(1, "SET x 5")
 	if got != "ERROR only 1 of 2 required replicas acked" {
 		t.Fatalf("SET with 1 of 3 up = %q, want quorum error", got)
 	}
@@ -150,7 +152,7 @@ func TestReadRepairFixesStaleNode(t *testing.T) {
 		t.Fatal("node 3 should not have x yet")
 	}
 	// R=3, so this read hears from node 3 and repairs it.
-	if got := c.send(1, "GET x"); got != "VALUE 5" {
+	if got, _ := c.send(1, "GET x"); got != "VALUE 5" {
 		t.Fatalf("GET = %q, want VALUE 5", got)
 	}
 
@@ -191,14 +193,26 @@ func TestConcurrentWritesAreBothKept(t *testing.T) {
 	// Heal: anti-entropy spreads both values everywhere.
 	c.nodes[0].antiEntropy()
 	c.nodes[2].antiEntropy()
-	if got := c.send(2, "GET x"); got != "VALUES a b" {
+	if got, _ := c.send(2, "GET x"); got != "VALUES a b" {
 		t.Fatalf("GET = %q, want VALUES a b (neither write lost)", got)
 	}
 
 	// The next SET has seen both, so it replaces both.
 	c.send(2, "SET x c")
 	c.nodes[1].antiEntropy() // W=1: make sure every node has c before reading with R=1
-	if got := c.send(1, "GET x"); got != "VALUE c" {
+	if got, _ := c.send(1, "GET x"); got != "VALUE c" {
 		t.Fatalf("GET after resolving = %q, want VALUE c", got)
+	}
+}
+
+func TestWriteKeepsValuesTheClientDidNotSee(t *testing.T) {
+	c := startCluster(t, 3, 2, 2)
+	c.send(1, "SET x a")
+	_, context := c.send(1, "GET x") // Alice reads a
+	c.send(1, "SET x bob")            // Bob writes through the same node; Alice doesn't see it
+	c.send(1, "SET x alice "+context) // Alice writes, based on what she read
+
+	if got, _ := c.send(3, "GET x"); got != "VALUES alice bob" {
+		t.Fatalf("GET = %q, want VALUES alice bob (Alice never saw bob)", got)
 	}
 }

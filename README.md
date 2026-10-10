@@ -2,7 +2,7 @@
 
 A leaderless, replicated key-value store in Go, in the style of Amazon Dynamo.
 
-Every node holds a full copy of the data and any node can serve any request. Each key is a state-based CRDT (MV-Register) tracked with vector clocks, so replicas always converge and concurrent writes are kept instead of silently dropped.
+Every node holds a full copy of the data and any node can serve any request. Each key is a state-based CRDT (MV-Register) tracked with dotted version vectors, so replicas always converge and concurrent writes are kept instead of silently dropped.
 
 > **Status:** experimental, built to explore replication and CRDTs. Not for production use.
 
@@ -27,33 +27,48 @@ Then talk to any node:
 
 ```sh
 go run ./cmd/client -addr localhost:9090 set user alice   # OK
-go run ./cmd/client -addr localhost:9092 get user         # VALUE alice
+go run ./cmd/client -addr localhost:9092 get user         # VALUE alice CONTEXT 1:1
 go run ./cmd/client -addr localhost:9091 del user         # OK
 ```
 
-Commands: `SET key value`, `GET key`, `DEL key`. Keys and values are single words.
+Commands: `SET key value [context]`, `GET key`, `DEL key [context]`. Keys and values are single words.
+
+`GET` also returns a **context**: what that read saw. Pass it to your next `SET`/`DEL` so it replaces only the values you actually read. Without it, a write replaces whatever the server currently has.
 
 Server flags: `-id` (this node's 1-based position in `-nodes`), `-nodes` (comma-separated addresses of all nodes, default localhost ports 9090–9092), `-w` and `-r` (write/read quorums, default 2).
 
 ## How it works
 
 ```
-   client ──► any node (coordinator)
-                  │  PUT / READ
+   client ──► any node (it coordinates the request)
+                  │
         ┌─────────┼─────────┐
-      node 1    node 2    node 3
+      node 1    node 2    node 3     (each holds a full copy)
 ```
 
-- **Write:** the coordinator reads the key from R nodes, creates a value whose vector clock covers everything it saw, sends it to all nodes, and replies after W acknowledgements.
-- **Read:** the coordinator asks all nodes, merges the first R answers, and sends the merged result back to those nodes (read repair).
-- **Vector clocks:** if one value's clock is ≥ another's in every slot, it replaces it. Otherwise the writes were concurrent, and both are kept.
-- **Merge:** keeps every value that no other value has seen. It's commutative, associative and idempotent, so replicas converge regardless of message order or duplicates.
-- **Deletes:** stored as tombstones, so a stale replica can't bring a value back.
-- **Anti-entropy:** every node periodically pushes all its entries to the others, so a node that was down catches up on every key.
+**Writing (SET / DEL).** The node you contact first asks the others what they have for the key, then sends the new value to every node. It replies `OK` once W nodes have saved it.
 
-| Path | Contents |
+**Reading (GET).** The node asks every node for the key and combines the first R answers. If some nodes had an older copy, it sends them the up-to-date one.
+
+**Detecting concurrent writes.** Each value records two things: its own ID (which node wrote it, and that node's write number, e.g. `1:1`) and the IDs of the writes it had seen. A value is replaced only by a value that had seen it:
+
+| Value | ID | Had seen | Result |
+|---|---|---|---|
+| `a` | `1:1` | nothing | |
+| `b`, written after reading `a` | `1:2` | `1:1` | `b` replaces `a` |
+| `c`, written by someone who never saw `b` | `2:1` | `1:1` | `b` and `c` are both kept: `GET` returns `VALUES b c` |
+
+A write made with the context of `VALUES b c` has seen both, so it replaces them.
+
+**Combining copies.** When two copies of a key meet, the result keeps every value that no other value has seen. Order and duplicate messages don't change the result, so all nodes end up identical (this is what makes it a CRDT).
+
+**Deletes.** DEL saves a "deleted" marker instead of removing the key, so a node with an old copy can't bring the value back.
+
+**Catching up.** Every 2 seconds, each node sends all its data to the others, so a node that was down gets every key back.
+
+| Folder | What's in it |
 |---|---|
-| `store/` | Vector clocks, MV-Register merge, thread-safe key → values map |
-| `clock/` | Counter for this node's own writes |
-| `cmd/server/` | TCP server, quorum reads/writes, read repair, anti-entropy |
+| `store/` | The data, write IDs and contexts, and the rule for combining copies |
+| `clock/` | Counts this node's own writes |
+| `cmd/server/` | The server: networking, reads, writes, catching up |
 | `cmd/client/` | Command-line client |

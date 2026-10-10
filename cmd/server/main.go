@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"kvstore/store"
 )
 
 // syncEvery: how often each node runs anti-entropy.
@@ -103,44 +105,52 @@ func handleCommand(line string, n *node) string {
 			}
 		}
 		slices.Sort(values)
+		// CONTEXT: what this read saw; pass it to the next SET/DEL so it replaces only these.
+		context := " CONTEXT " + formatVector(store.Context(entries))
 		switch len(values) {
 		case 0:
 			return "NOT_FOUND"
 		case 1:
-			return "VALUE " + values[0]
+			return "VALUE " + values[0] + context
 		default: // concurrent writes: show all, the next SET replaces them
-			return "VALUES " + strings.Join(values, " ")
+			return "VALUES " + strings.Join(values, " ") + context
 		}
 
-	case "SET":
-		if len(fields) != 3 {
-			return "ERROR usage: SET key value"
+	case "SET", "DEL":
+		// SET key value [context] / DEL key [context]
+		args := fields[1:]
+		want := 2
+		if cmd == "DEL" {
+			want = 1
 		}
-		if err := n.write(fields[1], fields[2], false); err != nil {
-			return "ERROR " + err.Error()
+		if len(args) != want && len(args) != want+1 {
+			return "ERROR usage: SET key value [context] / DEL key [context]"
 		}
-		return "OK"
-
-	case "DEL":
-		if len(fields) != 2 {
-			return "ERROR usage: DEL key"
+		var context store.Vector
+		if len(args) > want {
+			var err error
+			if context, err = parseVector(args[want]); err != nil {
+				return "ERROR " + err.Error()
+			}
 		}
-		if err := n.write(fields[1], "", true); err != nil {
+		value := ""
+		if cmd == "SET" {
+			value = args[1]
+		}
+		if err := n.write(args[0], value, cmd == "DEL", context); err != nil {
 			return "ERROR " + err.Error()
 		}
 		return "OK"
 
 	case "PUT":
 		if len(fields) < 3 {
-			return "ERROR usage: PUT key clock/deleted/value..."
+			return "ERROR usage: PUT key dot|context/deleted/value..."
 		}
 		entries, err := parseEntries(fields[2:])
 		if err != nil {
 			return "ERROR " + err.Error()
 		}
-		for _, e := range entries {
-			n.clock.Observe(e.Clock[n.id]) // after a restart, don't reuse our old counter values
-		}
+		n.clock.Observe(store.Context(entries)[n.id]) // after a restart, don't reuse our old write IDs
 		n.store.Apply(fields[1], entries)
 		return "ACK"
 

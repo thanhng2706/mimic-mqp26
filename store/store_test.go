@@ -3,9 +3,9 @@ package store
 import "testing"
 
 var (
-	a = Entry{Value: "a", Clock: Vector{1: 1}}       // written on node 1
-	b = Entry{Value: "b", Clock: Vector{3: 1}}       // written on node 3, without seeing a
-	c = Entry{Value: "c", Clock: Vector{1: 1, 3: 2}} // written on node 3 after seeing a and b
+	a = Entry{Value: "a", Dot: Dot{1, 1}}                             // node 1's 1st write
+	b = Entry{Value: "b", Dot: Dot{3, 1}}                             // node 3's 1st write, without seeing a
+	c = Entry{Value: "c", Dot: Dot{3, 2}, Context: Vector{1: 1, 3: 1}} // written after seeing a and b
 )
 
 func values(entries []Entry) []string {
@@ -27,6 +27,16 @@ func TestNewerValueReplacesSeenOnes(t *testing.T) {
 	got := Merge(Merge([]Entry{a}, []Entry{b}), []Entry{c})
 	if len(got) != 1 || got[0].Value != "c" {
 		t.Fatalf("got %v, want only c", values(got))
+	}
+}
+
+func TestUnseenWriteOnSameNodeIsKept(t *testing.T) {
+	// Bob writes x after seeing a; Alice, who only saw a, writes through the same node later.
+	bob := Entry{Value: "bob", Dot: Dot{1, 2}, Context: Vector{1: 1}}
+	alice := Entry{Value: "alice", Dot: Dot{1, 3}, Context: Vector{1: 1}}
+	got := Merge([]Entry{a, bob}, []Entry{alice})
+	if len(got) != 2 {
+		t.Fatalf("got %v, want bob and alice (alice never saw bob)", values(got))
 	}
 }
 
@@ -55,7 +65,7 @@ func TestTombstoneBlocksOldValue(t *testing.T) {
 	// A node that missed the delete sends back the old value later.
 	s := NewStore()
 	s.Apply("x", []Entry{a})
-	s.Apply("x", []Entry{{Deleted: true, Clock: Vector{1: 2}}})
+	s.Apply("x", []Entry{{Deleted: true, Dot: Dot{1, 2}, Context: Vector{1: 1}}})
 	s.Apply("x", []Entry{a})
 
 	if got := s.Get("x"); len(got) != 1 || !got[0].Deleted {
